@@ -24,6 +24,11 @@
 
 #include "spdk_internal/trace_defs.h"
 
+int spdk_iip_sock_recv_next_zcopy(struct spdk_sock *sock, size_t max_len,
+				  void **buf, void **ctx) __attribute__((weak));
+void spdk_iip_sock_recv_next_zcopy_release(struct spdk_sock *sock,
+		void *ctx) __attribute__((weak));
+
 #define NVMF_TCP_MAX_ACCEPT_SOCK_ONE_TIME 16
 #define SPDK_NVMF_TCP_DEFAULT_MAX_SOCK_PRIORITY 16
 #define SPDK_NVMF_TCP_DEFAULT_SOCK_PRIORITY 0
@@ -244,6 +249,9 @@ struct spdk_nvmf_tcp_req  {
 	 * h2c_offset is used when we receive the h2c_data PDU.
 	 */
 	uint32_t				h2c_offset;
+	uint32_t				rx_zcopy_bytes;
+	bool					rx_zcopy_candidate;
+	bool					rx_zcopy_disabled;
 
 	STAILQ_ENTRY(spdk_nvmf_tcp_req)		link;
 	TAILQ_ENTRY(spdk_nvmf_tcp_req)		state_link;
@@ -437,6 +445,9 @@ nvmf_tcp_req_get(struct spdk_nvmf_tcp_qpair *tqpair)
 	tcp_req->has_in_capsule_data = false;
 	tcp_req->req.dif_enabled = false;
 	tcp_req->req.zcopy_phase = NVMF_ZCOPY_PHASE_NONE;
+	tcp_req->rx_zcopy_bytes = 0;
+	tcp_req->rx_zcopy_candidate = false;
+	tcp_req->rx_zcopy_disabled = false;
 
 	TAILQ_REMOVE(&tqpair->tcp_req_free_queue, tcp_req, state_link);
 	TAILQ_INSERT_TAIL(&tqpair->tcp_req_working_queue, tcp_req, state_link);
@@ -452,6 +463,60 @@ nvmf_tcp_req_put(struct spdk_nvmf_tcp_qpair *tqpair, struct spdk_nvmf_tcp_req *t
 	TAILQ_REMOVE(&tqpair->tcp_req_working_queue, tcp_req, state_link);
 	TAILQ_INSERT_TAIL(&tqpair->tcp_req_free_queue, tcp_req, state_link);
 	nvmf_tcp_req_set_state(tcp_req, TCP_REQUEST_STATE_FREE);
+}
+
+static bool
+nvmf_tcp_iip_rx_zcopy_supported(struct spdk_sock *sock)
+{
+	return sock != NULL && sock->net_impl != NULL &&
+	       strcmp(sock->net_impl->name, "iip") == 0 &&
+	       spdk_iip_sock_recv_next_zcopy != NULL &&
+	       spdk_iip_sock_recv_next_zcopy_release != NULL;
+}
+
+static int
+nvmf_tcp_copy_to_iovs(struct iovec *iovs, uint32_t iovcnt, uint32_t offset,
+		      const void *buf, size_t len)
+{
+	const uint8_t *src = buf;
+	static uint64_t copy_calls;
+	static uint64_t copy_bytes;
+	uint32_t i;
+	uint32_t orig_offset = offset;
+	size_t orig_len = len;
+
+	if (iovs == NULL || iovcnt == 0) {
+		return -EINVAL;
+	}
+
+	for (i = 0; i < iovcnt && len > 0; i++) {
+		size_t n;
+
+		if (offset >= iovs[i].iov_len) {
+			offset -= iovs[i].iov_len;
+			continue;
+		}
+
+		n = spdk_min(len, iovs[i].iov_len - offset);
+		memcpy((uint8_t *)iovs[i].iov_base + offset, src, n);
+		src += n;
+		len -= n;
+		offset = 0;
+	}
+
+	if (len != 0) {
+		return -ENOBUFS;
+	}
+
+	copy_calls++;
+	copy_bytes += orig_len;
+	if (copy_calls <= 16 || copy_calls % 65536 == 0) {
+		SPDK_NOTICELOG("rx payload copy mbuf->nvmf_iov bytes=%zu offset=%u calls=%lu total_bytes=%lu\n",
+			       orig_len, orig_offset, (unsigned long)copy_calls,
+			       (unsigned long)copy_bytes);
+	}
+
+	return 0;
 }
 
 static void
@@ -1791,9 +1856,19 @@ nvmf_tcp_h2c_data_hdr_handle(struct spdk_nvmf_tcp_transport *ttransport,
 	}
 
 	pdu->req = tcp_req;
+	tcp_req->rx_zcopy_candidate = false;
 
 	if (spdk_unlikely(tcp_req->req.dif_enabled)) {
 		pdu->dif_ctx = &tcp_req->req.dif.dif_ctx;
+	}
+
+	if (nvmf_tcp_iip_rx_zcopy_supported(tqpair->sock) &&
+	    !tqpair->host_ddgst_enable && pdu->dif_ctx == NULL &&
+	    !tcp_req->rx_zcopy_disabled && tcp_req->req.data_from_pool &&
+	    tcp_req->req.iovcnt > 0 && h2c_data->datao == tcp_req->rx_zcopy_bytes) {
+		tcp_req->rx_zcopy_candidate = true;
+	} else {
+		tcp_req->rx_zcopy_disabled = true;
 	}
 
 	nvme_tcp_pdu_set_data_buf(pdu, tcp_req->req.iov, tcp_req->req.iovcnt,
@@ -2284,6 +2359,53 @@ err:
 }
 
 static int
+nvmf_tcp_read_payload_data_zcopy(struct spdk_nvmf_tcp_qpair *tqpair, struct nvme_tcp_pdu *pdu)
+{
+	struct spdk_nvmf_tcp_req *tcp_req = pdu->req;
+	void *buf = NULL, *ctx = NULL;
+	uint32_t remaining;
+	static uint64_t fallback_calls;
+	int rc;
+
+	if (tcp_req == NULL || !tcp_req->rx_zcopy_candidate) {
+		fallback_calls++;
+		if (fallback_calls <= 16 || fallback_calls % 65536 == 0) {
+			SPDK_NOTICELOG("rx payload fallback readv copy tcp_req=%p candidate=%d calls=%lu data_len=%u rw_offset=%u\n",
+				       tcp_req, tcp_req == NULL ? 0 : tcp_req->rx_zcopy_candidate,
+				       (unsigned long)fallback_calls, pdu->data_len, pdu->rw_offset);
+		}
+		return nvme_tcp_read_payload_data(tqpair->sock, pdu);
+	}
+
+	remaining = pdu->data_len - pdu->rw_offset;
+	rc = spdk_iip_sock_recv_next_zcopy(tqpair->sock, remaining, &buf, &ctx);
+	if (rc < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			return 0;
+		}
+		SPDK_NOTICELOG("rx payload recv_next_zcopy failed errno=%d, fallback readv copy\n", errno);
+		tcp_req->rx_zcopy_candidate = false;
+		tcp_req->rx_zcopy_disabled = true;
+		return nvme_tcp_read_payload_data(tqpair->sock, pdu);
+	}
+	if (rc == 0) {
+		return 0;
+	}
+
+	if (nvmf_tcp_copy_to_iovs(pdu->data_iov, pdu->data_iovcnt, pdu->rw_offset, buf, rc) != 0) {
+		spdk_iip_sock_recv_next_zcopy_release(tqpair->sock, ctx);
+		return NVME_TCP_CONNECTION_FATAL;
+	}
+	spdk_iip_sock_recv_next_zcopy_release(tqpair->sock, ctx);
+
+	tcp_req->rx_zcopy_bytes += rc;
+	if (tcp_req->rx_zcopy_bytes > tcp_req->req.length) {
+		return NVME_TCP_CONNECTION_FATAL;
+	}
+	return rc;
+}
+
+static int
 nvmf_tcp_sock_process(struct spdk_nvmf_tcp_qpair *tqpair)
 {
 	int rc = 0;
@@ -2377,7 +2499,7 @@ nvmf_tcp_sock_process(struct spdk_nvmf_tcp_qpair *tqpair)
 				pdu->ddgst_enable = true;
 			}
 
-			rc = nvme_tcp_read_payload_data(tqpair->sock, pdu);
+			rc = nvmf_tcp_read_payload_data_zcopy(tqpair, pdu);
 			if (rc < 0) {
 				nvmf_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_QUIESCING);
 				break;

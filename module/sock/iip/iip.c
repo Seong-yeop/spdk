@@ -95,10 +95,15 @@ enum spdk_iip_sock_type {
 };
 
 struct spdk_iip_rx_seg {
-	uint8_t				*buf;
+	struct rte_mbuf			*mbuf;
+	uint16_t			payload_off;
 	size_t				len;
 	size_t				off;
 	TAILQ_ENTRY(spdk_iip_rx_seg)	link;
+};
+
+struct spdk_iip_rx_zcopy_ctx {
+	struct rte_mbuf			*mbuf;
 };
 
 struct spdk_iip_sock {
@@ -183,6 +188,9 @@ static struct spdk_sock_impl_opts g_iip_impl_opts = {
 
 #define __iip_sock(sock) ((struct spdk_iip_sock *)(sock))
 #define __iip_group(group) ((struct spdk_iip_group_impl *)(group))
+
+int spdk_iip_sock_recv_next_zcopy(struct spdk_sock *_sock, size_t max_len, void **buf, void **ctx);
+void spdk_iip_sock_recv_next_zcopy_release(struct spdk_sock *sock, void *ctx);
 
 static const char *
 iip_sock_ip4_str(uint32_t ip_be, char *buf, size_t len)
@@ -387,7 +395,7 @@ iip_sock_rxq_free(struct spdk_iip_sock *sock)
 
 	while ((seg = TAILQ_FIRST(&sock->rxq)) != NULL) {
 		TAILQ_REMOVE(&sock->rxq, seg, link);
-		free(seg->buf);
+		rte_pktmbuf_free(seg->mbuf);
 		free(seg);
 	}
 
@@ -395,26 +403,34 @@ iip_sock_rxq_free(struct spdk_iip_sock *sock)
 }
 
 static int
-iip_sock_enqueue_payload(struct spdk_iip_sock *sock, const void *buf, size_t len)
+iip_sock_enqueue_payload(struct spdk_iip_sock *sock, struct rte_mbuf *m,
+			 uint16_t payload_off, size_t len)
 {
 	struct spdk_iip_rx_seg *seg;
+	struct rte_mbuf *clone;
 
 	if (len == 0) {
 		return 0;
 	}
 
+	if (sock->owner_group == NULL || sock->owner_group->clone_mbuf_pool == NULL ||
+	    payload_off + len > rte_pktmbuf_data_len(m)) {
+		return -EINVAL;
+	}
+
+	clone = rte_pktmbuf_clone(m, sock->owner_group->clone_mbuf_pool);
+	if (clone == NULL) {
+		return -ENOMEM;
+	}
+
 	seg = calloc(1, sizeof(*seg));
 	if (seg == NULL) {
+		rte_pktmbuf_free(clone);
 		return -ENOMEM;
 	}
 
-	seg->buf = malloc(len);
-	if (seg->buf == NULL) {
-		free(seg);
-		return -ENOMEM;
-	}
-
-	memcpy(seg->buf, buf, len);
+	seg->mbuf = clone;
+	seg->payload_off = payload_off;
 	seg->len = len;
 	TAILQ_INSERT_TAIL(&sock->rxq, seg, link);
 	sock->rxq_bytes += len;
@@ -1179,8 +1195,17 @@ iip_ops_tcp_payload(void *mem, void *handle, void *m, void *tcp_opaque,
 			  PB_TCP_HDR_HAS_SYN(m), PB_TCP_HDR_HAS_ACK(m),
 			  PB_TCP_HDR_HAS_FIN(m), PB_TCP_HDR_HAS_RST(m), sock->rxq_bytes);
 	if (payload_len >= head_off + tail_off) {
-		(void)iip_sock_enqueue_payload(sock, PB_TCP_PAYLOAD(m) + head_off,
-					       payload_len - head_off - tail_off);
+		uint8_t *base = rte_pktmbuf_mtod((struct rte_mbuf *)m, uint8_t *);
+		uint8_t *payload = PB_TCP_PAYLOAD(m) + head_off;
+		uint16_t payload_off = (uint16_t)(payload - base);
+		size_t payload_data_len = payload_len - head_off - tail_off;
+		int rc;
+
+		rc = iip_sock_enqueue_payload(sock, m, payload_off, payload_data_len);
+		if (rc != 0) {
+			SPDK_ERRLOG("iip failed to enqueue RX payload sock=%p len=%zu owner=%p rc=%d\n",
+				    sock, payload_data_len, sock->owner_group, rc);
+		}
 	}
 
 	iip_tcp_rxbuf_consumed(mem, handle, 1, opaque);
@@ -1565,8 +1590,10 @@ iip_sock_readv(struct spdk_sock *_sock, struct iovec *iov, int iovcnt)
 
 		while (avail > 0 && (seg = TAILQ_FIRST(&sock->rxq)) != NULL) {
 			size_t n = spdk_min(avail, seg->len - seg->off);
+			uint8_t *src = rte_pktmbuf_mtod(seg->mbuf, uint8_t *) +
+				       seg->payload_off + seg->off;
 
-			memcpy(dst, seg->buf + seg->off, n);
+			memcpy(dst, src, n);
 			dst += n;
 			avail -= n;
 			copied += n;
@@ -1575,7 +1602,7 @@ iip_sock_readv(struct spdk_sock *_sock, struct iovec *iov, int iovcnt)
 
 			if (seg->off == seg->len) {
 				TAILQ_REMOVE(&sock->rxq, seg, link);
-				free(seg->buf);
+				rte_pktmbuf_free(seg->mbuf);
 				free(seg);
 			}
 		}
@@ -1647,6 +1674,79 @@ iip_sock_recv_next(struct spdk_sock *sock, void **buf, void **ctx)
 	(void)ctx;
 	errno = ENOTSUP;
 	return -1;
+}
+
+int
+spdk_iip_sock_recv_next_zcopy(struct spdk_sock *_sock, size_t max_len, void **buf, void **ctx)
+{
+	struct spdk_iip_sock *sock = __iip_sock(_sock);
+	struct spdk_iip_rx_seg *seg;
+	struct spdk_iip_rx_zcopy_ctx *zctx;
+	struct rte_mbuf *hold;
+	size_t n;
+
+	if (sock->type != SPDK_IIP_SOCK_STREAM) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (sock->owner_group == NULL || sock->owner_group->clone_mbuf_pool == NULL) {
+		errno = ENOTSUP;
+		return -1;
+	}
+	if (max_len == 0) {
+		return 0;
+	}
+
+	seg = TAILQ_FIRST(&sock->rxq);
+	if (seg == NULL) {
+		if (sock->closed || !sock->connected) {
+			errno = ECONNRESET;
+			return -1;
+		}
+		errno = EAGAIN;
+		return -1;
+	}
+
+	zctx = calloc(1, sizeof(*zctx));
+	if (zctx == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	hold = rte_pktmbuf_clone(seg->mbuf, sock->owner_group->clone_mbuf_pool);
+	if (hold == NULL) {
+		free(zctx);
+		errno = ENOMEM;
+		return -1;
+	}
+
+	n = spdk_min(max_len, seg->len - seg->off);
+	zctx->mbuf = hold;
+	*buf = rte_pktmbuf_mtod(seg->mbuf, uint8_t *) + seg->payload_off + seg->off;
+	*ctx = zctx;
+
+	seg->off += n;
+	sock->rxq_bytes -= n;
+	if (seg->off == seg->len) {
+		TAILQ_REMOVE(&sock->rxq, seg, link);
+		rte_pktmbuf_free(seg->mbuf);
+		free(seg);
+	}
+	if (sock->rxq_bytes != 0) {
+		iip_sock_queue_ready(sock);
+	}
+
+	return (int)n;
+}
+
+void
+spdk_iip_sock_recv_next_zcopy_release(struct spdk_sock *sock, void *ctx)
+{
+	struct spdk_iip_rx_zcopy_ctx *zctx = ctx;
+
+	(void)sock;
+	rte_pktmbuf_free(zctx->mbuf);
+	free(zctx);
 }
 
 static int
