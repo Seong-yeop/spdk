@@ -49,6 +49,10 @@ ifeq ($(findstring y,$(CONFIG_CRYPTO_MLX5)$(CONFIG_VBDEV_COMPRESS_MLX5)),y)
 DPDK_DRIVERS += common/mlx5 bus/auxiliary
 endif
 
+# net/mlx5 ethdev PMD: required by the sock_iip module, which uses the
+# ConnectX NIC as a DPDK ethdev (rte_eth_rx_burst) rather than via RDMA verbs.
+DPDK_DRIVERS += net/mlx5 common/mlx5 bus/auxiliary
+
 ifeq ($(CONFIG_CRYPTO),y)
 DPDK_DRIVERS += crypto
 # aesni_mb is name of the PMD in DPDK 21.08 and earlier

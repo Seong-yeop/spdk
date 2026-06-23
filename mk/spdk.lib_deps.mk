@@ -115,6 +115,7 @@ DEPDIRS-env_dpdk_rpc := $(JSON_LIBS)
 
 # module/sock
 DEPDIRS-sock_posix := log sock util
+DEPDIRS-sock_iip := env_dpdk log sock util
 DEPDIRS-sock_uring := log sock util
 
 # module/scheduler

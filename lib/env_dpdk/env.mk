@@ -33,7 +33,17 @@ endif
 DPDK_INC := -I$(DPDK_INC_DIR)
 
 DPDK_LIB_LIST = rte_eal rte_mempool rte_ring rte_mbuf rte_bus_pci rte_pci rte_mempool_ring
+DPDK_LIB_LIST += rte_ethdev rte_net
 DPDK_LIB_LIST += rte_telemetry rte_kvargs rte_rcu
+
+DPDK_NET_MLX5=n
+ifneq (, $(wildcard $(DPDK_LIB_DIR)/librte_net_mlx5.*))
+DPDK_NET_MLX5=y
+DPDK_LIB_LIST += rte_net_mlx5 rte_common_mlx5
+ifneq (, $(wildcard $(DPDK_LIB_DIR)/librte_bus_auxiliary.*))
+DPDK_LIB_LIST += rte_bus_auxiliary
+endif
+endif
 
 DPDK_POWER=n
 
@@ -134,6 +144,10 @@ ENV_CFLAGS = $(DPDK_INC) -DALLOW_EXPERIMENTAL_API
 ENV_CXXFLAGS = $(ENV_CFLAGS)
 
 DPDK_PRIVATE_LINKER_ARGS =
+
+ifeq ($(DPDK_NET_MLX5),y)
+DPDK_PRIVATE_LINKER_ARGS += -L/usr/lib64/mft -lmtcr_ul -lmlx5 -libverbs -lnl-route-3 -lnl-3
+endif
 
 ifeq ($(CONFIG_IPSEC_MB),y)
 DPDK_PRIVATE_LINKER_ARGS += -lIPSec_MB
