@@ -3333,7 +3333,11 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	tgroup = SPDK_CONTAINEROF(group, struct spdk_nvmf_tcp_poll_group, group);
 
 	if (spdk_unlikely(TAILQ_EMPTY(&tgroup->qpairs) && TAILQ_EMPTY(&tgroup->await_req))) {
-		return 0;
+		rc = spdk_sock_group_poll(tgroup->sock_group);
+		if (rc < 0) {
+			SPDK_ERRLOG("Failed to poll sock_group=%p\n", tgroup->sock_group);
+		}
+		return rc;
 	}
 
 	STAILQ_FOREACH_SAFE(req, &group->pending_buf_queue, buf_link, req_tmp) {

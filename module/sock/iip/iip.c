@@ -138,7 +138,6 @@ struct spdk_iip_group_impl {
 	struct rte_mempool		*clone_mbuf_pool;
 	struct rte_mbuf			*tx[IIP_SOCK_TX_BATCH];
 	uint16_t			tx_cnt;
-	uint32_t			active_sock_count;
 	struct iip_sock_tailq		ready_socks;
 	TAILQ_ENTRY(spdk_iip_group_impl) link;
 };
@@ -251,6 +250,16 @@ iip_sock_global_lists_init(void)
 	}
 	if (g_iip.listeners.tqh_last == NULL) {
 		TAILQ_INIT(&g_iip.listeners);
+	}
+}
+
+static void
+iip_sock_set_poll_when_empty_locked(bool enable)
+{
+	struct spdk_iip_group_impl *group;
+
+	TAILQ_FOREACH(group, &g_iip.groups, link) {
+		spdk_sock_group_impl_set_poll_when_empty(&group->base, enable);
 	}
 }
 
@@ -668,27 +677,6 @@ iip_sock_group_poll_rx(struct spdk_iip_group_impl *group)
 		(void **)mbufs, cnt, &next_us, group);
 	(void)next_us;
 	return cnt;
-}
-
-static int
-iip_sock_poll_idle_groups_for_accept(void)
-{
-	struct spdk_iip_group_impl *group;
-	int rc = 0;
-
-	pthread_mutex_lock(&g_iip.lock);
-	TAILQ_FOREACH(group, &g_iip.groups, link) {
-		if (group->active_sock_count != 0) {
-			continue;
-		}
-		pthread_mutex_unlock(&g_iip.lock);
-		(void)iip_sock_group_refresh_config(group);
-		rc += iip_sock_group_poll_rx(group);
-		pthread_mutex_lock(&g_iip.lock);
-	}
-	pthread_mutex_unlock(&g_iip.lock);
-
-	return rc;
 }
 
 static void *
@@ -1475,6 +1463,7 @@ iip_sock_listen(const char *ip, int port, struct spdk_sock_opts *opts)
 	if (rc == 0) {
 		memcpy(sock->local_mac, g_iip.local_mac, sizeof(sock->local_mac));
 		TAILQ_INSERT_TAIL(&g_iip.listeners, sock, link);
+		iip_sock_set_poll_when_empty_locked(true);
 	}
 	pthread_mutex_unlock(&g_iip.lock);
 
@@ -1497,8 +1486,6 @@ iip_sock_accept(struct spdk_sock *_sock)
 		errno = EINVAL;
 		return NULL;
 	}
-
-	iip_sock_poll_idle_groups_for_accept();
 
 	pthread_mutex_lock(&g_iip.lock);
 	sock = TAILQ_FIRST(&listener->pending_accepts);
@@ -1531,6 +1518,9 @@ iip_sock_close(struct spdk_sock *_sock)
 	if (sock->type == SPDK_IIP_SOCK_LISTEN) {
 		pthread_mutex_lock(&g_iip.lock);
 		TAILQ_REMOVE(&g_iip.listeners, sock, link);
+		if (TAILQ_EMPTY(&g_iip.listeners)) {
+			iip_sock_set_poll_when_empty_locked(false);
+		}
 		while ((child = TAILQ_FIRST(&sock->pending_accepts)) != NULL) {
 			TAILQ_REMOVE(&sock->pending_accepts, child, pending_link);
 			iip_sock_unqueue_ready(child);
@@ -1765,6 +1755,7 @@ iip_sock_group_impl_create(void)
 	}
 	group->queueid = queueid;
 	group->portid = g_iip.portid;
+	spdk_sock_group_impl_set_poll_when_empty(&group->base, !TAILQ_EMPTY(&g_iip.listeners));
 	TAILQ_INSERT_TAIL(&g_iip.groups, group, link);
 	pthread_mutex_unlock(&g_iip.lock);
 
@@ -1786,7 +1777,6 @@ iip_sock_group_impl_add_sock(struct spdk_sock_group_impl *_group, struct spdk_so
 {
 	struct spdk_iip_group_impl *group = __iip_group(_group);
 	struct spdk_iip_sock *sock = __iip_sock(_sock);
-	struct spdk_iip_group_impl *prev_owner = sock->owner_group;
 
 	if (sock->owner_group != NULL && sock->owner_group != group) {
 		errno = EINVAL;
@@ -1794,10 +1784,9 @@ iip_sock_group_impl_add_sock(struct spdk_sock_group_impl *_group, struct spdk_so
 	}
 
 	sock->owner_group = group;
-	group->active_sock_count++;
-		IIP_SOCK_TRACELOG("iip group add sock=%p group=%p queue=%u prev_owner=%p handle=%p connected=%d closed=%d rxq=%zu active=%u\n",
-				  sock, group, group->queueid, prev_owner, sock->tcp_handle,
-				  sock->connected, sock->closed, sock->rxq_bytes, group->active_sock_count);
+	IIP_SOCK_TRACELOG("iip group add sock=%p group=%p queue=%u handle=%p connected=%d closed=%d rxq=%zu\n",
+			  sock, group, group->queueid, sock->tcp_handle,
+			  sock->connected, sock->closed, sock->rxq_bytes);
 	if (sock->rxq_bytes != 0 || sock->closed) {
 		/*
 		 * spdk_sock_group_add_sock() sets base.group_impl after this callback
@@ -1817,9 +1806,7 @@ iip_sock_group_impl_remove_sock(struct spdk_sock_group_impl *_group, struct spdk
 	struct spdk_iip_sock *sock = __iip_sock(_sock);
 
 	iip_sock_unqueue_ready(sock);
-	if (group->active_sock_count > 0) {
-		group->active_sock_count--;
-	}
+	(void)group;
 
 	return 0;
 }

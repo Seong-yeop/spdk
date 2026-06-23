@@ -711,7 +711,8 @@ sock_group_impl_poll_count(struct spdk_sock_group_impl *group_impl,
 	struct spdk_sock *socks[MAX_EVENTS_PER_POLL];
 	int num_events, i;
 
-	if (TAILQ_EMPTY(&group_impl->socks)) {
+	if (TAILQ_EMPTY(&group_impl->socks) &&
+	    !spdk_sock_group_impl_get_poll_when_empty(group_impl)) {
 		return 0;
 	}
 

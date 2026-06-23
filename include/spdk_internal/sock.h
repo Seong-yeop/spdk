@@ -65,8 +65,21 @@ struct spdk_sock_group_impl {
 	struct spdk_net_impl			*net_impl;
 	struct spdk_sock_group			*group;
 	TAILQ_HEAD(, spdk_sock)			socks;
+	bool					poll_when_empty;
 	STAILQ_ENTRY(spdk_sock_group_impl)	link;
 };
+
+static inline bool
+spdk_sock_group_impl_get_poll_when_empty(struct spdk_sock_group_impl *group_impl)
+{
+	return __atomic_load_n(&group_impl->poll_when_empty, __ATOMIC_ACQUIRE);
+}
+
+static inline void
+spdk_sock_group_impl_set_poll_when_empty(struct spdk_sock_group_impl *group_impl, bool enable)
+{
+	__atomic_store_n(&group_impl->poll_when_empty, enable, __ATOMIC_RELEASE);
+}
 
 struct spdk_sock_map {
 	STAILQ_HEAD(, spdk_sock_placement_id_entry) entries;
