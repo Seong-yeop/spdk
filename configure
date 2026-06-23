@@ -63,6 +63,7 @@ function usage() {
 	echo " --without-idxd            Disabled while experimental. Only built for x86 when enabled."
 	echo " --with-crypto             Build isa-l-crypto and vbdev crypto module. No path required."
 	echo " --without-crypto          Disable isa-l-crypto and vbdev crypto module."
+	echo " --without-isal            Disable ISA-L and dependent software crypto/compression modules."
 	echo " --with-fio[=DIR]          Build fio_plugin."
 	echo " --without-fio             default: /usr/src/fio"
 	echo " --with-xnvme              Build xNVMe bdev module."
@@ -508,6 +509,9 @@ for i in "$@"; do
 			;;
 		--without-crypto)
 			CONFIG[CRYPTO]=n
+			;;
+		--without-isal)
+			CONFIG[ISAL]=n
 			;;
 		--with-vhost)
 			CONFIG[VHOST]=y
@@ -1174,7 +1178,9 @@ if [[ "${CONFIG[FUZZER]}" = "y" && "$CC_TYPE" != "clang" ]]; then
 	exit 1
 fi
 
-if [[ $arch == x86_64* ]] || [[ $arch == aarch64* ]]; then
+if [[ "${CONFIG[ISAL]}" = "n" ]]; then
+	echo "Notice: ISA-L disabled by user. Turning off default ISA-L and crypto/compression features."
+elif [[ $arch == x86_64* ]] || [[ $arch == aarch64* ]]; then
 	CONFIG[ISAL]=y
 	# make sure the submodule is initialized
 	if [ ! -f "$rootdir"/isa-l/autogen.sh ]; then
