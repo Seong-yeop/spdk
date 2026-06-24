@@ -20,6 +20,8 @@
 
 #include "spdk/env.h"
 #include "spdk/log.h"
+#include "spdk/nvmf_transport.h"
+#include "spdk/nvmf_spec.h"
 #include "spdk/string.h"
 #include "spdk/util.h"
 #include "spdk_internal/sock.h"
@@ -88,6 +90,7 @@ static void iip_ops_util_now_ns(uint32_t t[3], void *opaque);
 TAILQ_HEAD(iip_sock_tailq, spdk_iip_sock);
 TAILQ_HEAD(iip_group_tailq, spdk_iip_group_impl);
 TAILQ_HEAD(iip_rx_tailq, spdk_iip_rx_seg);
+TAILQ_HEAD(iip_tx_req_tailq, spdk_iip_tx_req);
 
 enum spdk_iip_sock_type {
 	SPDK_IIP_SOCK_LISTEN,
@@ -99,6 +102,28 @@ struct spdk_iip_rx_seg {
 	size_t				len;
 	size_t				off;
 	TAILQ_ENTRY(spdk_iip_rx_seg)	link;
+};
+
+struct spdk_iip_tx_req {
+	struct spdk_iip_sock		*sock;
+	struct spdk_sock_request		*req;
+	uint32_t			pending_acks;
+	uint32_t			active_extbufs;
+	int				err;
+	bool				all_submitted;
+	bool				pending;
+	bool				aborted;
+	TAILQ_ENTRY(spdk_iip_tx_req)	link;
+};
+
+struct spdk_iip_tx_seg {
+	struct rte_mbuf_ext_shared_info	shinfo;
+	struct spdk_iip_tx_req		*tx_req;
+};
+
+struct iip_sock_zcopy_range {
+	size_t				start;
+	size_t				end;
 };
 
 struct spdk_iip_sock {
@@ -120,6 +145,7 @@ struct spdk_iip_sock {
 	int				recvlowat;
 	struct iip_rx_tailq		rxq;
 	size_t				rxq_bytes;
+	struct iip_tx_req_tailq		tx_reqs;
 	struct iip_sock_tailq		pending_accepts;
 	TAILQ_ENTRY(spdk_iip_sock)	link;
 	TAILQ_ENTRY(spdk_iip_sock)	ready_link;
@@ -392,6 +418,78 @@ iip_sock_rxq_free(struct spdk_iip_sock *sock)
 	}
 
 	sock->rxq_bytes = 0;
+}
+
+static void
+iip_sock_tx_req_try_complete(struct spdk_iip_tx_req *tx_req)
+{
+	struct spdk_iip_sock *sock;
+	struct spdk_sock_request *req;
+	int err;
+
+	if (tx_req->aborted) {
+		if (tx_req->active_extbufs != 0) {
+			return;
+		}
+		free(tx_req);
+		return;
+	}
+
+	if (!tx_req->pending || !tx_req->all_submitted || tx_req->pending_acks != 0 ||
+	    tx_req->active_extbufs != 0) {
+		return;
+	}
+
+	sock = tx_req->sock;
+	req = tx_req->req;
+	err = tx_req->err;
+	TAILQ_REMOVE(&sock->tx_reqs, tx_req, link);
+	free(tx_req);
+	(void)spdk_sock_request_put(&sock->base, req, err);
+}
+
+static void
+iip_sock_extbuf_free_cb(void *addr, void *opaque)
+{
+	struct spdk_iip_tx_seg *seg = opaque;
+	struct spdk_iip_tx_req *tx_req = seg->tx_req;
+
+	(void)addr;
+	assert(tx_req->active_extbufs > 0);
+	tx_req->active_extbufs--;
+	free(seg);
+	iip_sock_tx_req_try_complete(tx_req);
+}
+
+static struct spdk_iip_tx_req *
+iip_sock_tx_req_find(struct spdk_iip_sock *sock, struct spdk_sock_request *req)
+{
+	struct spdk_iip_tx_req *tx_req;
+
+	TAILQ_FOREACH(tx_req, &sock->tx_reqs, link) {
+		if (tx_req->req == req) {
+			return tx_req;
+		}
+	}
+
+	return NULL;
+}
+
+static void
+iip_sock_tx_reqs_abort(struct spdk_iip_sock *sock)
+{
+	struct spdk_iip_tx_req *tx_req;
+
+	while ((tx_req = TAILQ_FIRST(&sock->tx_reqs)) != NULL) {
+		TAILQ_REMOVE(&sock->tx_reqs, tx_req, link);
+		tx_req->aborted = true;
+		tx_req->sock = NULL;
+		tx_req->req = NULL;
+		tx_req->pending = false;
+		tx_req->all_submitted = true;
+		tx_req->pending_acks = 0;
+		iip_sock_tx_req_try_complete(tx_req);
+	}
 }
 
 static int
@@ -714,10 +812,15 @@ static void
 iip_ops_pkt_set_len(void *pkt, uint16_t len, void *opaque)
 {
 	struct rte_mbuf *m = pkt;
+	struct rte_mbuf *seg;
+	uint32_t pkt_len = len;
 
 	(void)opaque;
 	m->data_len = len;
-	m->pkt_len = len;
+	for (seg = m->next; seg != NULL; seg = seg->next) {
+		pkt_len += seg->data_len;
+	}
+	m->pkt_len = pkt_len;
 }
 
 static void
@@ -783,7 +886,7 @@ iip_ops_pkt_clone(void *pkt, void *opaque)
 	clone->data_len = len;
 	clone->pkt_len = len;
 	clone->nb_segs = 1;
-	clone->ol_flags = src->ol_flags;
+	clone->ol_flags = src->ol_flags & ~(RTE_MBUF_F_EXTERNAL | RTE_MBUF_F_INDIRECT);
 	clone->l2_len = src->l2_len;
 	clone->l3_len = src->l3_len;
 	clone->l4_len = src->l4_len;
@@ -793,8 +896,12 @@ iip_ops_pkt_clone(void *pkt, void *opaque)
 static void
 iip_ops_pkt_scatter_gather_chain_append(void *pkt_head, void *pkt_tail, void *opaque)
 {
+	int rc;
+
 	(void)opaque;
-	assert(rte_pktmbuf_chain(pkt_head, pkt_tail) == 0);
+	rc = rte_pktmbuf_chain(pkt_head, pkt_tail);
+	assert(rc == 0);
+	(void)rc;
 }
 
 static void *
@@ -802,6 +909,13 @@ iip_ops_pkt_scatter_gather_chain_get_next(void *pkt_head, void *opaque)
 {
 	(void)opaque;
 	return ((struct rte_mbuf *)pkt_head)->next;
+}
+
+static uint8_t
+iip_ops_pkt_tx_payload_can_chain(void *pkt, void *opaque)
+{
+	(void)opaque;
+	return RTE_MBUF_HAS_EXTBUF((struct rte_mbuf *)pkt) ? 1 : 0;
 }
 
 static uint16_t
@@ -931,7 +1045,7 @@ static uint8_t
 iip_ops_nic_feature_offload_tx_scatter_gather(void *opaque)
 {
 	(void)opaque;
-	return 0;
+	return (g_iip.port_conf.txmode.offloads & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) ? 1 : 0;
 }
 
 static uint8_t
@@ -1119,6 +1233,7 @@ iip_ops_tcp_accepted(void *mem, void *handle, void *m, void *opaque)
 	memcpy(sock->local_mac, iip_ops_l2_hdr_dst_ptr(m, opaque), sizeof(sock->local_mac));
 	memcpy(sock->peer_mac, iip_ops_l2_hdr_src_ptr(m, opaque), sizeof(sock->peer_mac));
 	TAILQ_INIT(&sock->rxq);
+	TAILQ_INIT(&sock->tx_reqs);
 	TAILQ_INIT(&sock->pending_accepts);
 
 	pthread_mutex_lock(&g_iip.lock);
@@ -1189,11 +1304,25 @@ iip_ops_tcp_payload(void *mem, void *handle, void *m, void *tcp_opaque,
 static void
 iip_ops_tcp_acked(void *mem, void *handle, void *m, void *tcp_opaque, void *opaque)
 {
+	struct rte_mbuf *mbuf = m;
+	struct spdk_iip_tx_seg *seg;
+	struct spdk_iip_tx_req *tx_req;
+
 	(void)mem;
 	(void)handle;
-	(void)m;
 	(void)tcp_opaque;
 	(void)opaque;
+
+	if (mbuf == NULL || !RTE_MBUF_HAS_EXTBUF(mbuf)) {
+		return;
+	}
+
+	seg = mbuf->shinfo->fcb_opaque;
+	tx_req = seg->tx_req;
+	if (tx_req->pending_acks > 0) {
+		tx_req->pending_acks--;
+	}
+	iip_sock_tx_req_try_complete(tx_req);
 }
 
 static void
@@ -1224,6 +1353,7 @@ iip_ops_tcp_closed(void *handle, uint8_t local_mac[], uint32_t local_ip4_be,
 		sock->connected = false;
 		sock->closed = true;
 		if (sock->closing) {
+			iip_sock_tx_reqs_abort(sock);
 			iip_sock_unqueue_ready(sock);
 			iip_sock_rxq_free(sock);
 			free(sock);
@@ -1316,6 +1446,173 @@ iip_sock_mbuf_from_iovs(struct spdk_iip_group_impl *group, const struct iovec *i
 	return m;
 }
 
+static bool
+iip_sock_copy_from_iovs(const struct iovec *iov, int iovcnt, size_t offset, void *buf, size_t len)
+{
+	uint8_t *dst = buf;
+	size_t copied = 0;
+	int i;
+
+	if (len == 0) {
+		return true;
+	}
+
+	for (i = 0; i < iovcnt; i++) {
+		size_t iov_len = iov[i].iov_len;
+		size_t copy_len;
+
+		if (offset >= iov_len) {
+			offset -= iov_len;
+			continue;
+		}
+
+		copy_len = spdk_min(iov_len - offset, len - copied);
+		memcpy(dst + copied, (uint8_t *)iov[i].iov_base + offset, copy_len);
+		copied += copy_len;
+		offset = 0;
+		if (copied == len) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool
+iip_sock_req_is_nvme_read_c2h(struct spdk_sock_request *req)
+{
+	struct spdk_nvmf_request *nvmf_req;
+
+	/*
+	 * NVMf/TCP sets sock_req.cb_arg to struct spdk_nvmf_tcp_req.  Its first
+	 * field is struct spdk_nvmf_request, so this cast is valid after the
+	 * caller has verified that the outgoing PDU is C2H_DATA.
+	 */
+	nvmf_req = req->cb_arg;
+	if (nvmf_req == NULL || nvmf_req->qpair == NULL || nvmf_req->cmd == NULL) {
+		return false;
+	}
+
+	if (nvmf_req->qpair->qid == 0 ||
+	    nvmf_req->xfer != SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
+		return false;
+	}
+
+	return nvmf_req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ;
+}
+
+static bool
+iip_sock_get_c2h_data_zcopy_range(struct spdk_sock_request *req, const struct iovec *iov,
+				  int iovcnt, size_t req_len,
+				  struct iip_sock_zcopy_range *range)
+{
+	struct spdk_nvme_tcp_c2h_data_hdr c2h_data = {};
+	uint64_t data_end;
+	uint32_t plen;
+
+	range->start = 0;
+	range->end = 0;
+
+	if (req_len < sizeof(c2h_data) ||
+	    !iip_sock_copy_from_iovs(iov, iovcnt, 0, &c2h_data, sizeof(c2h_data))) {
+		return false;
+	}
+
+	if (c2h_data.common.pdu_type != SPDK_NVME_TCP_PDU_TYPE_C2H_DATA) {
+		return false;
+	}
+
+	if (!iip_sock_req_is_nvme_read_c2h(req)) {
+		return false;
+	}
+
+	plen = c2h_data.common.plen;
+	if (c2h_data.common.hlen != sizeof(c2h_data) ||
+	    c2h_data.common.pdo < c2h_data.common.hlen ||
+	    c2h_data.common.pdo > plen ||
+	    plen > req_len ||
+	    c2h_data.datal == 0) {
+		return false;
+	}
+
+	data_end = (uint64_t)c2h_data.common.pdo + c2h_data.datal;
+	if (data_end > plen || data_end > req_len || data_end > SIZE_MAX) {
+		return false;
+	}
+
+	range->start = c2h_data.common.pdo;
+	range->end = (size_t)data_end;
+
+	return range->start < range->end;
+}
+
+static struct rte_mbuf *
+iip_sock_mbuf_from_iovs_zcopy(struct spdk_iip_group_impl *group, const struct iovec *iov,
+			      int iovcnt, size_t offset, size_t max_len, size_t *total_len,
+			      struct spdk_iip_tx_req *tx_req)
+{
+	struct rte_mbuf *m;
+	struct spdk_iip_tx_seg *seg;
+	uint8_t *base;
+	uint64_t phys_addr, phys_len;
+	size_t scan_offset = offset;
+	size_t len;
+	int i;
+
+	*total_len = 0;
+	for (i = 0; i < iovcnt; i++) {
+		size_t iov_len = iov[i].iov_len;
+
+		if (scan_offset >= iov_len) {
+			scan_offset -= iov_len;
+			continue;
+		}
+
+		base = (uint8_t *)iov[i].iov_base + scan_offset;
+		len = spdk_min(iov_len - scan_offset, max_len);
+		len = spdk_min(len, (size_t)UINT16_MAX);
+		phys_len = len;
+		phys_addr = spdk_vtophys(base, &phys_len);
+		if (phys_addr == SPDK_VTOPHYS_ERROR || phys_len == 0) {
+			errno = EFAULT;
+			return NULL;
+		}
+		len = spdk_min(len, (size_t)phys_len);
+
+		m = iip_ops_pkt_alloc(group);
+		if (m == NULL) {
+			errno = ENOBUFS;
+			return NULL;
+		}
+
+		seg = calloc(1, sizeof(*seg));
+		if (seg == NULL) {
+			rte_pktmbuf_free(m);
+			errno = ENOMEM;
+			return NULL;
+		}
+
+		seg->tx_req = tx_req;
+		seg->shinfo.free_cb = iip_sock_extbuf_free_cb;
+		seg->shinfo.fcb_opaque = seg;
+		rte_mbuf_ext_refcnt_set(&seg->shinfo, 1);
+
+		rte_pktmbuf_attach_extbuf(m, base, phys_addr, (uint16_t)len, &seg->shinfo);
+		tx_req->active_extbufs++;
+		if (rte_pktmbuf_append(m, (uint16_t)len) == NULL) {
+			rte_pktmbuf_free(m);
+			errno = EMSGSIZE;
+			return NULL;
+		}
+
+		*total_len = len;
+		return m;
+	}
+
+	errno = EMSGSIZE;
+	return NULL;
+}
+
 static int
 iip_sock_send_iovs(struct spdk_iip_sock *sock, struct iovec *iov, int iovcnt,
 		   size_t offset, size_t max_len, size_t *total_len)
@@ -1345,13 +1642,58 @@ iip_sock_send_iovs(struct spdk_iip_sock *sock, struct iovec *iov, int iovcnt,
 	return 0;
 }
 
+static bool
+iip_sock_can_zcopy(struct spdk_iip_sock *sock)
+{
+	if (!sock->base.opts.zcopy || sock->owner_group == NULL) {
+		return false;
+	}
+
+	return iip_ops_nic_feature_offload_tx_scatter_gather(sock->owner_group) != 0;
+}
+
+static int
+iip_sock_send_iovs_zcopy(struct spdk_iip_sock *sock, struct iovec *iov, int iovcnt,
+			 size_t offset, size_t max_len, size_t *total_len,
+			 struct spdk_iip_tx_req *tx_req)
+{
+	struct rte_mbuf *m;
+
+	*total_len = 0;
+	if (sock->owner_group == NULL || sock->tcp_handle == NULL || !sock->connected) {
+		SPDK_NOTICELOG("iip send ENOTCONN sock=%p type=%d owner=%p base_group=%p handle=%p connected=%d closed=%d iovcnt=%d\n",
+			       sock, sock->type, sock->owner_group, sock->base.group_impl, sock->tcp_handle,
+			       sock->connected, sock->closed, iovcnt);
+		errno = ENOTCONN;
+		return -1;
+	}
+
+	m = iip_sock_mbuf_from_iovs_zcopy(sock->owner_group, iov, iovcnt, offset, max_len,
+					  total_len, tx_req);
+	if (m == NULL) {
+		return -1;
+	}
+
+	if (iip_tcp_send(sock->owner_group->workspace, sock->tcp_handle, m, 0x08U, sock->owner_group) != 0) {
+		iip_ops_pkt_free(m, sock->owner_group);
+		errno = EIO;
+		return -1;
+	}
+
+	tx_req->pending_acks++;
+	return 0;
+}
+
 static int
 iip_sock_flush_queued_reqs(struct spdk_iip_sock *sock)
 {
 	struct spdk_sock_request *req, *tmp;
+	struct spdk_iip_tx_req *tx_req;
+	struct iip_sock_zcopy_range zcopy_range;
 	struct iovec *iovs;
 	size_t total_len, req_len;
 	int bytes = 0;
+	bool zcopy;
 
 	TAILQ_FOREACH_SAFE(req, &sock->base.queued_reqs, internal.link, tmp) {
 		iovs = SPDK_SOCK_REQUEST_IOV(req, 0);
@@ -1363,13 +1705,77 @@ iip_sock_flush_queued_reqs(struct spdk_iip_sock *sock)
 			req_len += iovs[i].iov_len;
 		}
 
+		zcopy = iip_sock_can_zcopy(sock) &&
+			iip_sock_get_c2h_data_zcopy_range(req, iovs, req->iovcnt, req_len, &zcopy_range);
+		tx_req = NULL;
+		if (zcopy) {
+			tx_req = iip_sock_tx_req_find(sock, req);
+			if (tx_req == NULL) {
+				tx_req = calloc(1, sizeof(*tx_req));
+				if (tx_req == NULL) {
+					spdk_sock_request_pend(&sock->base, req);
+					(void)spdk_sock_request_put(&sock->base, req, -ENOMEM);
+					errno = ENOMEM;
+					return bytes > 0 ? bytes : -1;
+				}
+				tx_req->sock = sock;
+				tx_req->req = req;
+				TAILQ_INSERT_TAIL(&sock->tx_reqs, tx_req, link);
+			}
+		}
+
 		while (req->internal.offset < req_len) {
-			if (iip_sock_send_iovs(sock, iovs, req->iovcnt, req->internal.offset,
-					       IIP_SOCK_MAX_SEND_CHUNK, &total_len) != 0) {
+			size_t max_len = spdk_min((size_t)IIP_SOCK_MAX_SEND_CHUNK,
+						  req_len - req->internal.offset);
+			bool chunk_zcopy = false;
+			int rc;
+
+			if (zcopy && req->internal.offset < zcopy_range.start) {
+				max_len = spdk_min(max_len, zcopy_range.start - req->internal.offset);
+			} else if (zcopy && req->internal.offset < zcopy_range.end) {
+				max_len = spdk_min(max_len, zcopy_range.end - req->internal.offset);
+				chunk_zcopy = true;
+			}
+
+			if (chunk_zcopy) {
+				rc = iip_sock_send_iovs_zcopy(sock, iovs, req->iovcnt,
+							      req->internal.offset,
+							      max_len,
+							      &total_len, tx_req);
+				if (rc == 0) {
+					req->internal.is_zcopy = true;
+				} else if (errno == EFAULT) {
+					rc = iip_sock_send_iovs(sock, iovs, req->iovcnt,
+								req->internal.offset, max_len,
+								&total_len);
+				}
+			} else {
+				rc = iip_sock_send_iovs(sock, iovs, req->iovcnt,
+							req->internal.offset,
+							max_len, &total_len);
+			}
+			if (rc != 0) {
 				int err = errno;
 
-				if (bytes > 0) {
+				if (tx_req != NULL && (tx_req->pending_acks != 0 ||
+						       tx_req->active_extbufs != 0)) {
+					spdk_sock_request_pend(&sock->base, req);
+					tx_req->pending = true;
+					tx_req->all_submitted = true;
+					tx_req->err = -err;
+					iip_sock_tx_req_try_complete(tx_req);
+					errno = err;
+					return bytes > 0 ? bytes : -1;
+				} else if (bytes > 0) {
+					if (tx_req != NULL) {
+						TAILQ_REMOVE(&sock->tx_reqs, tx_req, link);
+						free(tx_req);
+					}
 					return bytes;
+				}
+				if (tx_req != NULL) {
+					TAILQ_REMOVE(&sock->tx_reqs, tx_req, link);
+					free(tx_req);
 				}
 				spdk_sock_request_pend(&sock->base, req);
 				(void)spdk_sock_request_put(&sock->base, req, -err);
@@ -1381,7 +1787,11 @@ iip_sock_flush_queued_reqs(struct spdk_iip_sock *sock)
 		}
 
 		spdk_sock_request_pend(&sock->base, req);
-		if (spdk_sock_request_put(&sock->base, req, 0) < 0) {
+		if (zcopy) {
+			tx_req->pending = true;
+			tx_req->all_submitted = true;
+			iip_sock_tx_req_try_complete(tx_req);
+		} else if (spdk_sock_request_put(&sock->base, req, 0) < 0) {
 			break;
 		}
 	}
@@ -1452,6 +1862,7 @@ iip_sock_listen(const char *ip, int port, struct spdk_sock_opts *opts)
 	sock->local_ip_be = ip_be;
 	sock->local_port_be = htons((uint16_t)port);
 	TAILQ_INIT(&sock->rxq);
+	TAILQ_INIT(&sock->tx_reqs);
 	TAILQ_INIT(&sock->pending_accepts);
 
 	pthread_mutex_lock(&g_iip.lock);
@@ -1523,6 +1934,7 @@ iip_sock_close(struct spdk_sock *_sock)
 		}
 		while ((child = TAILQ_FIRST(&sock->pending_accepts)) != NULL) {
 			TAILQ_REMOVE(&sock->pending_accepts, child, pending_link);
+			iip_sock_tx_reqs_abort(child);
 			iip_sock_unqueue_ready(child);
 			iip_sock_rxq_free(child);
 			free(child);
@@ -1533,6 +1945,7 @@ iip_sock_close(struct spdk_sock *_sock)
 	}
 
 	iip_sock_unqueue_ready(sock);
+	iip_sock_tx_reqs_abort(sock);
 	if (sock->connected && sock->owner_group != NULL && sock->tcp_handle != NULL) {
 		sock->closing = true;
 		sock->connected = false;
