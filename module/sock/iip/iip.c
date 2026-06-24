@@ -483,11 +483,6 @@ iip_sock_tx_reqs_abort(struct spdk_iip_sock *sock)
 	while ((tx_req = TAILQ_FIRST(&sock->tx_reqs)) != NULL) {
 		TAILQ_REMOVE(&sock->tx_reqs, tx_req, link);
 		tx_req->aborted = true;
-		tx_req->sock = NULL;
-		tx_req->req = NULL;
-		tx_req->pending = false;
-		tx_req->all_submitted = true;
-		tx_req->pending_acks = 0;
 		iip_sock_tx_req_try_complete(tx_req);
 	}
 }
@@ -1447,35 +1442,20 @@ iip_sock_mbuf_from_iovs(struct spdk_iip_group_impl *group, const struct iovec *i
 }
 
 static bool
-iip_sock_copy_from_iovs(const struct iovec *iov, int iovcnt, size_t offset, void *buf, size_t len)
+iip_sock_copy_from_iovs(const struct iovec *iov, int iovcnt, void *buf, size_t len)
 {
 	uint8_t *dst = buf;
 	size_t copied = 0;
 	int i;
 
-	if (len == 0) {
-		return true;
-	}
+	for (i = 0; i < iovcnt && copied < len; i++) {
+		size_t copy_len = spdk_min(iov[i].iov_len, len - copied);
 
-	for (i = 0; i < iovcnt; i++) {
-		size_t iov_len = iov[i].iov_len;
-		size_t copy_len;
-
-		if (offset >= iov_len) {
-			offset -= iov_len;
-			continue;
-		}
-
-		copy_len = spdk_min(iov_len - offset, len - copied);
-		memcpy(dst + copied, (uint8_t *)iov[i].iov_base + offset, copy_len);
+		memcpy(dst + copied, iov[i].iov_base, copy_len);
 		copied += copy_len;
-		offset = 0;
-		if (copied == len) {
-			return true;
-		}
 	}
 
-	return false;
+	return copied == len;
 }
 
 static bool
@@ -1514,7 +1494,7 @@ iip_sock_get_c2h_data_zcopy_range(struct spdk_sock_request *req, const struct io
 	range->end = 0;
 
 	if (req_len < sizeof(c2h_data) ||
-	    !iip_sock_copy_from_iovs(iov, iovcnt, 0, &c2h_data, sizeof(c2h_data))) {
+	    !iip_sock_copy_from_iovs(iov, iovcnt, &c2h_data, sizeof(c2h_data))) {
 		return false;
 	}
 
@@ -1536,7 +1516,7 @@ iip_sock_get_c2h_data_zcopy_range(struct spdk_sock_request *req, const struct io
 	}
 
 	data_end = (uint64_t)c2h_data.common.pdo + c2h_data.datal;
-	if (data_end > plen || data_end > req_len || data_end > SIZE_MAX) {
+	if (data_end > plen) {
 		return false;
 	}
 
@@ -1661,9 +1641,6 @@ iip_sock_send_iovs_zcopy(struct spdk_iip_sock *sock, struct iovec *iov, int iovc
 
 	*total_len = 0;
 	if (sock->owner_group == NULL || sock->tcp_handle == NULL || !sock->connected) {
-		SPDK_NOTICELOG("iip send ENOTCONN sock=%p type=%d owner=%p base_group=%p handle=%p connected=%d closed=%d iovcnt=%d\n",
-			       sock, sock->type, sock->owner_group, sock->base.group_impl, sock->tcp_handle,
-			       sock->connected, sock->closed, iovcnt);
 		errno = ENOTCONN;
 		return -1;
 	}
@@ -1742,9 +1719,7 @@ iip_sock_flush_queued_reqs(struct spdk_iip_sock *sock)
 							      req->internal.offset,
 							      max_len,
 							      &total_len, tx_req);
-				if (rc == 0) {
-					req->internal.is_zcopy = true;
-				} else if (errno == EFAULT) {
+				if (rc != 0 && errno == EFAULT) {
 					rc = iip_sock_send_iovs(sock, iovs, req->iovcnt,
 								req->internal.offset, max_len,
 								&total_len);
@@ -1766,16 +1741,13 @@ iip_sock_flush_queued_reqs(struct spdk_iip_sock *sock)
 					iip_sock_tx_req_try_complete(tx_req);
 					errno = err;
 					return bytes > 0 ? bytes : -1;
-				} else if (bytes > 0) {
-					if (tx_req != NULL) {
-						TAILQ_REMOVE(&sock->tx_reqs, tx_req, link);
-						free(tx_req);
-					}
-					return bytes;
 				}
 				if (tx_req != NULL) {
 					TAILQ_REMOVE(&sock->tx_reqs, tx_req, link);
 					free(tx_req);
+				}
+				if (bytes > 0) {
+					return bytes;
 				}
 				spdk_sock_request_pend(&sock->base, req);
 				(void)spdk_sock_request_put(&sock->base, req, -err);
