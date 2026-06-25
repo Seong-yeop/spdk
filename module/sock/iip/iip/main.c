@@ -72,6 +72,7 @@ static void iip_ops_pkt_decrement_tail(void *, uint16_t, void *);
 static void *iip_ops_pkt_clone(void *, void *); /* assuming the entire packet chain is cloned while reference counts to the payload buffers are also incremented */
 static void iip_ops_pkt_scatter_gather_chain_append(void *, void *, void *);
 static void *iip_ops_pkt_scatter_gather_chain_get_next(void *, void *);
+static uint8_t iip_ops_pkt_tx_payload_can_chain(void *, void *);
 static uint16_t iip_ops_l2_hdr_len(void *, void *);
 static uint8_t *iip_ops_l2_hdr_src_ptr(void *, void *);
 static uint8_t *iip_ops_l2_hdr_dst_ptr(void *, void *);
@@ -583,6 +584,14 @@ static struct pb *__iip_clone_pb(struct workspace *s, struct pb *orig, void *opa
 	return p;
 }
 
+static void *
+__iip_tcp_payload_pkt(struct pb *p, void *opaque)
+{
+	void *pkt = iip_ops_pkt_scatter_gather_chain_get_next(p->pkt, opaque);
+
+	return pkt ? pkt : p->orig_pkt;
+}
+
 /* exported utilitiy functions */
 
 static uint32_t iip_workspace_size(void)
@@ -662,7 +671,8 @@ again:
 		uint16_t l = (conn->mss < 536 ? 536 : conn->mss) - (0 /* size of ip option */ + __iip_round_up((syn ? 4 + 3 + (IIP_CONF_TCP_OPT_SACK_OK ? 2 : 0) : 0) + (sackbuf ? sackbuf[1] : 0) + (IIP_CONF_TCP_TIMESTAMP_ENABLE ? 12 : 0), 4)) /* size of tcp option */;
 		payload_len = (l < (uint16_t) (total_payload_len - pushed_payload_len) ? l : total_payload_len - pushed_payload_len);
 		if (payload_len != total_payload_len) {
-			__iip_assert((pkt = iip_ops_pkt_clone(_pkt, opaque)) != NULL);
+			pkt = iip_ops_pkt_clone(_pkt, opaque);
+			__iip_assert(pkt != NULL);
 			iip_ops_pkt_increment_head(pkt, pushed_payload_len, opaque);
 			iip_ops_pkt_set_len(pkt, payload_len, opaque);
 		}
@@ -758,7 +768,8 @@ again:
 			iip_ops_nic_offload_tcp_tx_checksum_mark(out_p->pkt, opaque); /* relies on the value of tcp hdr len on packet buf */
 	}
 
-	if (iip_ops_nic_feature_offload_tx_scatter_gather(opaque)) {
+	if (iip_ops_nic_feature_offload_tx_scatter_gather(opaque) && pkt &&
+			iip_ops_pkt_tx_payload_can_chain(pkt, opaque)) {
 		if (pkt) iip_ops_pkt_scatter_gather_chain_append(out_p->pkt, pkt, opaque);
 		iip_ops_pkt_set_len(out_p->pkt, iip_ops_l2_hdr_len(out_p->pkt, opaque) + (PB_IP4(out_p->pkt)->vl & 0x0f) * 4 + PB_TCP_HDR_LEN(out_p->pkt) * 4, opaque);
 	} else {
@@ -918,7 +929,8 @@ static uint16_t iip_udp_send(void *_mem,
 			} else
 				iip_ops_nic_offload_udp_tx_checksum_mark(out_pkt, opaque);
 
-			if (iip_ops_nic_feature_offload_tx_scatter_gather(opaque)) {
+			if (iip_ops_nic_feature_offload_tx_scatter_gather(opaque) && pkt &&
+					iip_ops_pkt_tx_payload_can_chain(pkt, opaque)) {
 				if (pkt) iip_ops_pkt_scatter_gather_chain_append(out_pkt, pkt, opaque);
 				iip_ops_pkt_set_len(out_pkt, iip_ops_l2_hdr_len(out_pkt, opaque) + (ip4h->vl & 0x0f) * 4 + sizeof(struct iip_udp_hdr), opaque);
 			} else {
@@ -2796,10 +2808,7 @@ static uint16_t iip_run(void *_mem, uint8_t mac[], uint32_t ip4_be, void *pkt[],
 															uint16_t i;
 															for (i = 0; i < _p->clone.to_be_updated - 1; i++) {
 																void *_p_pkt;
-																if (iip_ops_nic_feature_offload_tx_scatter_gather(opaque))
-																	_p_pkt = iip_ops_pkt_scatter_gather_chain_get_next(_p->pkt, opaque);
-																else
-																	_p_pkt = _p->orig_pkt;
+																_p_pkt = __iip_tcp_payload_pkt(_p, opaque);
 																__iip_assert(_p_pkt);
 																if (_p->clone.range[_p->clone.to_be_updated - 1].increment_head > iip_ops_pkt_get_len(_p_pkt, opaque) /* TODO: no multi segment */ - _p->clone.range[i].decrement_tail) {
 																	/*
@@ -2946,30 +2955,16 @@ static uint16_t iip_run(void *_mem, uint8_t mac[], uint32_t ip4_be, void *pkt[],
 										uint16_t i;
 										for (i = 0; (i < p->clone.to_be_updated) || (p->flags & __IIP_PB_FLAGS_SACK_REPLY_SEND_ALL); i++) {
 											void *cp;
-											if (iip_ops_nic_feature_offload_tx_scatter_gather(opaque)) {
-												if (iip_ops_pkt_scatter_gather_chain_get_next(p->pkt, opaque)) {
-													cp = iip_ops_pkt_clone(iip_ops_pkt_scatter_gather_chain_get_next(p->pkt, opaque), opaque);
-													__iip_assert(cp);
-													if (p->clone.to_be_updated) {
-														if (p->clone.range[i].increment_head) iip_ops_pkt_increment_head(cp, p->clone.range[i].increment_head, opaque);
-														if (p->clone.range[i].decrement_tail) iip_ops_pkt_decrement_tail(cp, p->clone.range[i].decrement_tail, opaque);
-													}
-												} else {
-													cp = NULL;
-													__iip_assert(PB_TCP_HDR_HAS_SYN(p->pkt) || PB_TCP_HDR_HAS_FIN(p->pkt));
+											cp = __iip_tcp_payload_pkt(p, opaque);
+											if (cp) {
+												cp = iip_ops_pkt_clone(cp, opaque);
+												__iip_assert(cp);
+												if (p->clone.to_be_updated) {
+													if (p->clone.range[i].increment_head) iip_ops_pkt_increment_head(cp, p->clone.range[i].increment_head, opaque);
+													if (p->clone.range[i].decrement_tail) iip_ops_pkt_decrement_tail(cp, p->clone.range[i].decrement_tail, opaque);
 												}
 											} else {
-												if (p->orig_pkt) {
-													cp = iip_ops_pkt_clone(p->orig_pkt, opaque);
-													__iip_assert(cp);
-													if (p->clone.to_be_updated) {
-														if (p->clone.range[i].increment_head) iip_ops_pkt_increment_head(cp, p->clone.range[i].increment_head, opaque);
-														if (p->clone.range[i].decrement_tail) iip_ops_pkt_decrement_tail(cp, p->clone.range[i].decrement_tail, opaque);
-													}
-												} else {
-													cp = NULL;
-													__iip_assert(PB_TCP_HDR_HAS_SYN(p->pkt) || PB_TCP_HDR_HAS_FIN(p->pkt));
-												}
+												__iip_assert(PB_TCP_HDR_HAS_SYN(p->pkt) || PB_TCP_HDR_HAS_FIN(p->pkt));
 											}
 											{ /* CLONE */
 												struct iip_tcp_conn _conn;
@@ -3016,26 +3011,16 @@ static uint16_t iip_run(void *_mem, uint8_t mac[], uint32_t ip4_be, void *pkt[],
 					} else if (conn->dup_ack_received == 3) { /* 3 dup acks are received, we do retransmission for fast recovery, or sack */
 						__iip_assert(!(!conn->head[2][0] && conn->head[2][1]));
 						__iip_assert(!(conn->head[2][0] && !conn->head[2][1]));
-						if (conn->head[2][0]) {
-							{ /* send one packet requested by peer */
-								void *cp;
-								if (iip_ops_nic_feature_offload_tx_scatter_gather(opaque)) {
-									if (iip_ops_pkt_scatter_gather_chain_get_next(conn->head[2][0]->pkt, opaque)) {
-										cp = iip_ops_pkt_clone(iip_ops_pkt_scatter_gather_chain_get_next(conn->head[2][0]->pkt, opaque), opaque);
+							if (conn->head[2][0]) {
+								{ /* send one packet requested by peer */
+									void *cp;
+									cp = __iip_tcp_payload_pkt(conn->head[2][0], opaque);
+									if (cp) {
+										cp = iip_ops_pkt_clone(cp, opaque);
 										__iip_assert(cp);
 									} else {
-										cp = NULL;
 										__iip_assert(PB_TCP_HDR_HAS_SYN(conn->head[2][0]->pkt) || PB_TCP_HDR_HAS_FIN(conn->head[2][0]->pkt));
 									}
-								} else {
-									if (conn->head[2][0]->orig_pkt) {
-										cp = iip_ops_pkt_clone(conn->head[2][0]->orig_pkt, opaque);
-										__iip_assert(cp);
-									} else {
-										cp = NULL;
-										__iip_assert(PB_TCP_HDR_HAS_SYN(conn->head[2][0]->pkt) || PB_TCP_HDR_HAS_FIN(conn->head[2][0]->pkt));
-									}
-								}
 								if (conn->acked_seq != __iip_ntohl(PB_TCP(conn->head[2][0]->pkt)->seq_be)) {
 									__iip_assert(cp);
 									/*
@@ -3108,27 +3093,17 @@ static uint16_t iip_run(void *_mem, uint8_t mac[], uint32_t ip4_be, void *pkt[],
 					/* timeout check */
 					if (!conn->head[3][0]) { /* not in recovery mode */
 						if (conn->head[2][0]) {
-							if (conn->head[2][0]->tcp.rto_ms < now_ms - conn->head[2][0]->ts) { /* timeout and do retransmission */
-								if (conn->retrans_cnt < IIP_CONF_TCP_RETRANS_CNT) {
-									void *cp;
-									if (iip_ops_nic_feature_offload_tx_scatter_gather(opaque)) {
-										if (iip_ops_pkt_scatter_gather_chain_get_next(conn->head[2][0]->pkt, opaque)) {
-											cp = iip_ops_pkt_clone(iip_ops_pkt_scatter_gather_chain_get_next(conn->head[2][0]->pkt, opaque), opaque);
+								if (conn->head[2][0]->tcp.rto_ms < now_ms - conn->head[2][0]->ts) { /* timeout and do retransmission */
+									if (conn->retrans_cnt < IIP_CONF_TCP_RETRANS_CNT) {
+										void *cp;
+										cp = __iip_tcp_payload_pkt(conn->head[2][0], opaque);
+										if (cp) {
+											cp = iip_ops_pkt_clone(cp, opaque);
 											__iip_assert(cp);
 										} else {
-											cp = NULL;
 											__iip_assert(PB_TCP_HDR_HAS_SYN(conn->head[2][0]->pkt) || PB_TCP_HDR_HAS_FIN(conn->head[2][0]->pkt));
 										}
-									} else {
-										if (conn->head[2][0]->orig_pkt) {
-											cp = iip_ops_pkt_clone(conn->head[2][0]->orig_pkt, opaque);
-											__iip_assert(cp);
-										} else {
-											cp = NULL;
-											__iip_assert(PB_TCP_HDR_HAS_SYN(conn->head[2][0]->pkt) || PB_TCP_HDR_HAS_FIN(conn->head[2][0]->pkt));
-										}
-									}
-									{ /* CLONE */
+										{ /* CLONE */
 										struct iip_tcp_conn _conn;
 										__iip_memcpy(&_conn, conn, sizeof(_conn));
 										_conn.seq_be = PB_TCP(conn->head[2][0]->pkt)->seq_be;
