@@ -57,9 +57,14 @@
 #define IIP_SOCK_RX_BATCH		32
 #define IIP_SOCK_TX_BATCH		32
 #define IIP_SOCK_MBUF_CACHE_SIZE	256
+#define IIP_SOCK_ENABLE_RX_LRO		1
+#if IIP_SOCK_ENABLE_RX_LRO
 #define IIP_SOCK_MBUF_DATA_ROOM		0xffff
+#else
+#define IIP_SOCK_MBUF_DATA_ROOM		2048
+#endif
 #define IIP_SOCK_CLONE_MBUF_DATA_ROOM	RTE_MBUF_DEFAULT_BUF_SIZE
-#define IIP_SOCK_MAX_SEND_CHUNK		(60 * 1024)
+#define IIP_SOCK_MAX_SEND_CHUNK		1448
 #define IIP_SOCK_NETSTACK_PB		8192
 #define IIP_SOCK_NETSTACK_TCP_CONN	4096
 
@@ -533,6 +538,20 @@ iip_sock_global_port_init(void)
 	if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_CHECKSUM) {
 		conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_CHECKSUM;
 	}
+#if IIP_SOCK_ENABLE_RX_LRO && defined(RTE_ETH_RX_OFFLOAD_TCP_LRO)
+	if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TCP_LRO) {
+		uint32_t max_lro_pkt_size = spdk_min(dev_info.max_lro_pkt_size,
+						     (uint32_t)(IIP_SOCK_MBUF_DATA_ROOM -
+								RTE_PKTMBUF_HEADROOM));
+
+		if (max_lro_pkt_size > RTE_ETHER_MAX_LEN) {
+			conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_TCP_LRO;
+			conf.rxmode.max_lro_pkt_size = max_lro_pkt_size;
+			SPDK_NOTICELOG("iip sock enabling RX LRO max_lro_pkt_size=%u data_room=%u\n",
+				       max_lro_pkt_size, IIP_SOCK_MBUF_DATA_ROOM);
+		}
+	}
+#endif
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) {
 		conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
 	}
